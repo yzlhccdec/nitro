@@ -5,17 +5,20 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"math/big"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/offchainlabs/nitro/arbos"
 	"github.com/offchainlabs/nitro/gethhook"
 )
 
@@ -45,6 +48,188 @@ func sendTestFrame(t *testing.T, conn net.Conn, seq, number uint64, parent commo
 		t.Fatal(err)
 	}
 	return hash
+}
+
+func sendTestPayload(t *testing.T, conn net.Conn, payload []byte) {
+	t.Helper()
+	var prefix [4]byte
+	binary.BigEndian.PutUint32(prefix[:], uint32(len(payload)))
+	if _, err := conn.Write(append(prefix[:], payload...)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReceiverV2OutputsCompleteFactsAndGap(t *testing.T) {
+	producer, server := net.Pipe()
+	defer producer.Close()
+	_ = producer.SetDeadline(time.Now().Add(2 * time.Second))
+	out := new(safeOutput)
+	r := &receiver{output: out, protocolVersion: 2}
+	go r.accept(server)
+	var hello [5]byte
+	if _, err := io.ReadFull(producer, hello[:]); err != nil {
+		t.Fatal(err)
+	}
+	if string(hello[:]) != "NTXR2" {
+		t.Fatalf("wrong hello: %q", hello)
+	}
+	if _, err := producer.Write(append([]byte("NTXS2"), make([]byte, 16)...)); err != nil {
+		t.Fatal(err)
+	}
+	manager := common.HexToAddress("0x8366a39cc670b4001a1121b8f6a443a643e40951")
+	caller := common.HexToAddress("0xbd665831a520182e944af92b23a317791c5d8efa")
+	path := []uint16{0, 3, 0, 5, 0, 2, 0, 0, 4}
+	poolKey := make([]byte, 160)
+	copy(poolKey[12:32], common.HexToAddress("0x5fc5360d0400a0fd4f2af552add042d716f1d168").Bytes())
+	copy(poolKey[44:64], common.HexToAddress("0xce24439f2d9c6a2289f741120fe202248b666666").Bytes())
+	poolKey[95], poolKey[127] = 75, 1
+	input := append([]byte{0xf3, 0xcd, 0x91, 0x4c}, poolKey...)
+	tx := arbos.NativeTxEvidence{TxHash: common.HexToHash("0x265a1284fcf97ad174592ef653fa63e87401f952ea1f29a16d924b3b9c55456c"), TxType: 2, FactsComplete: true,
+		Transfers: []arbos.NativeTransfer{{From: caller, To: manager, Value: big.NewInt(42), Kind: 0xf1, TraceAddress: path}},
+		Calls:     []arbos.NativeCallFact{{TraceAddress: path, From: caller, To: manager, Kind: 0xf1, Value: big.NewInt(0), Input: input, Success: true}},
+		LogScopes: []arbos.NativeLogScope{{Index: 19, TraceAddress: path}},
+	}
+	first := gethhook.NativeJournalFrame{Sequence: 1, BlockNumber: 69477187, ParentHash: common.HexToHash("0x1111"), BlockHash: common.HexToHash("0x7f1ef4982ad19e254f04c01d1ec07ec57f2948b96922c3efa2fbe7937ff4186f"), Complete: true, Txs: []arbos.NativeTxEvidence{tx}}
+	payload, err := gethhook.EncodeNativeStreamFrame(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendTestPayload(t, producer, payload)
+	second := gethhook.NativeJournalFrame{Sequence: 3, BlockNumber: first.BlockNumber + 2, ParentHash: first.BlockHash, BlockHash: common.HexToHash("0x2222"), Complete: true, Txs: []arbos.NativeTxEvidence{{TxHash: common.HexToHash("0x3333"), FactsComplete: false, Calls: tx.Calls, LogScopes: tx.LogScopes}}}
+	payload, err = gethhook.EncodeNativeStreamFrame(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendTestPayload(t, producer, payload)
+	until := time.Now().Add(time.Second)
+	for strings.Count(out.String(), "\n") < 2 && time.Now().Before(until) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two NDJSON blocks, got %q", out.String())
+	}
+	var a, b outputBlock
+	if err := json.Unmarshal([]byte(lines[0]), &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &b); err != nil {
+		t.Fatal(err)
+	}
+	if a.Schema != "native_stream_v2" || a.FrameVersion != 2 || !a.ContinuityUnknown || len(a.Transactions) != 1 {
+		t.Fatalf("wrong V2 header: %+v", a)
+	}
+	got := a.Transactions[0]
+	if got.Hash != tx.TxHash.Hex() || got.Index != 0 || got.Type != tx.TxType || !got.FactsComplete || len(got.Transfers) != 1 || got.Transfers[0].ValueWei != "42" || got.Transfers[0].Kind != 0xf1 || len(got.Transfers[0].TraceAddress) != len(path) || len(got.Calls) != 1 || got.Calls[0].InputHex != "0x"+hex.EncodeToString(input) || got.Calls[0].ValueWei != "0" || !got.Calls[0].Success || len(got.LogScopes) != 1 || got.LogScopes[0].LogIndex != 19 || got.LogScopes[0].TraceAddress[len(path)-1] != 4 {
+		t.Fatalf("lost V2 facts: %+v", got)
+	}
+	if b.ContinuityUnknown || !strings.Contains(b.Gap, "sequence_1_to_3") || b.Transactions[0].FactsComplete {
+		t.Fatalf("gap/incomplete not visible: %+v", b)
+	}
+	if len(b.Transactions[0].Calls) != 0 || len(b.Transactions[0].LogScopes) != 0 {
+		t.Fatalf("incomplete facts escaped to JSON: %+v", b.Transactions[0])
+	}
+	if fixture := os.Getenv("NTX2_FIXTURE_OUT"); fixture != "" {
+		if err := os.WriteFile(fixture, []byte(out.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReceiverRejectsFrameVersionMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version uint8
+		ready   string
+		encode  func(gethhook.NativeJournalFrame) ([]byte, error)
+	}{
+		{"v2_receives_v1", 2, "NTXS2", gethhook.EncodeNativeFrame},
+		{"v1_receives_v2", 1, "NTXS1", gethhook.EncodeNativeStreamFrame},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			producer, server := net.Pipe()
+			defer producer.Close()
+			_ = producer.SetDeadline(time.Now().Add(time.Second))
+			out := new(safeOutput)
+			r := &receiver{output: out, protocolVersion: tc.version}
+			go r.accept(server)
+			var hello [5]byte
+			if _, err := io.ReadFull(producer, hello[:]); err != nil {
+				t.Fatal(err)
+			}
+			if string(hello[:4]) != "NTXR" || hello[4] != '0'+tc.version {
+				t.Fatalf("unexpected hello: %q", hello)
+			}
+			if _, err := producer.Write(append([]byte(tc.ready), make([]byte, 16)...)); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := tc.encode(gethhook.NativeJournalFrame{Sequence: 1, BlockNumber: 100, BlockHash: common.HexToHash("0x1234"), Complete: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sendTestPayload(t, producer, payload)
+			var scratch [1]byte
+			if _, err := producer.Read(scratch[:]); err == nil {
+				t.Fatal("mismatched stream remained open")
+			}
+			if out.String() != "" {
+				t.Fatalf("mismatched frame emitted output: %q", out.String())
+			}
+		})
+	}
+}
+
+func TestReceiverV2RejectsWrongHandshakeAndMalformedFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ready  string
+		mutate func([]byte) []byte
+	}{
+		{"wrong_ready", "NTXS1", nil},
+		{"truncated", "NTXS2", func(b []byte) []byte { return b[:len(b)-1] }},
+		{"trailing", "NTXS2", func(b []byte) []byte { return append(b, 0xff) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			producer, server := net.Pipe()
+			defer producer.Close()
+			_ = producer.SetDeadline(time.Now().Add(time.Second))
+			out := new(safeOutput)
+			r := &receiver{output: out, protocolVersion: 2}
+			done := make(chan struct{})
+			go func() { r.accept(server); close(done) }()
+			var hello [5]byte
+			if _, err := io.ReadFull(producer, hello[:]); err != nil {
+				t.Fatal(err)
+			}
+			if string(hello[:]) != "NTXR2" {
+				t.Fatalf("wrong hello %q", hello)
+			}
+			if _, err := producer.Write(append([]byte(tc.ready), make([]byte, 16)...)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.mutate == nil {
+				<-done
+				if r.current != nil || out.String() != "" {
+					t.Fatal("wrong V2 ready was accepted")
+				}
+				return
+			}
+			<-done
+			frame := gethhook.NativeJournalFrame{Sequence: 1, BlockNumber: 100, BlockHash: common.HexToHash("0x1234"), Complete: true}
+			payload, err := gethhook.EncodeNativeStreamFrame(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sendTestPayload(t, producer, tc.mutate(payload))
+			var scratch [1]byte
+			if _, err := producer.Read(scratch[:]); err == nil {
+				t.Fatal("malformed V2 stream remained open")
+			}
+			if out.String() != "" {
+				t.Fatalf("malformed V2 frame emitted output: %q", out.String())
+			}
+		})
+	}
 }
 
 func TestReceiverOutputsGapAndZeroTransferBlocks(t *testing.T) {

@@ -777,6 +777,7 @@ func produceBlockAdvanced(
 			evidence := NativeTxEvidence{TxHash: tx.Hash(), TxType: tx.Type()}
 			if nativeTx != nil {
 				evidence.Transfers = nativeTx.transfers(receipt)
+				evidence.FactsComplete, evidence.Calls, evidence.LogScopes = nativeTx.facts(receipt)
 			}
 			buildState.nativeEvidence = append(buildState.nativeEvidence, evidence)
 		}

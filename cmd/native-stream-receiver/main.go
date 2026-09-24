@@ -20,17 +20,37 @@ import (
 )
 
 type outputTransfer struct {
-	From     string `json:"from"`
-	To       string `json:"to"`
-	ValueWei string `json:"value_wei"`
-	Kind     uint8  `json:"kind"`
+	From         string   `json:"from"`
+	To           string   `json:"to"`
+	ValueWei     string   `json:"value_wei"`
+	Kind         uint8    `json:"kind"`
+	TraceAddress []uint16 `json:"trace_address"`
+}
+type outputCall struct {
+	TraceAddress []uint16 `json:"trace_address"`
+	From         string   `json:"from"`
+	To           string   `json:"to"`
+	Kind         uint8    `json:"kind"`
+	ValueWei     string   `json:"value_wei"`
+	InputHex     string   `json:"input_hex"`
+	Success      bool     `json:"success"`
+}
+type outputLogScope struct {
+	LogIndex     uint32   `json:"log_index"`
+	TraceAddress []uint16 `json:"trace_address"`
 }
 type outputTx struct {
-	Hash      string           `json:"hash"`
-	Type      uint8            `json:"type"`
-	Transfers []outputTransfer `json:"transfers"`
+	Hash          string           `json:"hash"`
+	Index         uint32           `json:"transaction_index"`
+	Type          uint8            `json:"type"`
+	FactsComplete bool             `json:"facts_complete"`
+	Transfers     []outputTransfer `json:"transfers"`
+	Calls         []outputCall     `json:"calls"`
+	LogScopes     []outputLogScope `json:"log_scopes"`
 }
 type outputBlock struct {
+	Schema            string     `json:"schema"`
+	FrameVersion      uint8      `json:"frame_version"`
 	Epoch             string     `json:"epoch"`
 	Sequence          uint64     `json:"seq"`
 	Number            uint64     `json:"block_number"`
@@ -43,15 +63,16 @@ type outputBlock struct {
 }
 
 type receiver struct {
-	mu         sync.Mutex
-	current    net.Conn
-	epoch      [16]byte
-	lastSeq    uint64
-	lastNumber uint64
-	lastHash   common.Hash
-	output     io.Writer
-	fatal      chan error
-	failed     atomic.Bool
+	mu              sync.Mutex
+	protocolVersion uint8
+	current         net.Conn
+	epoch           [16]byte
+	lastSeq         uint64
+	lastNumber      uint64
+	lastHash        common.Hash
+	output          io.Writer
+	fatal           chan error
+	failed          atomic.Bool
 }
 
 func (r *receiver) accept(conn net.Conn) {
@@ -59,7 +80,13 @@ func (r *receiver) accept(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	epoch, err := gethhook.PerformNativeReceiverHandshake(conn)
+	var epoch [16]byte
+	var err error
+	if r.protocolVersion == 2 {
+		epoch, err = gethhook.PerformNativeReceiverHandshakeV2(conn)
+	} else {
+		epoch, err = gethhook.PerformNativeReceiverHandshake(conn)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "native receiver handshake:", err)
 		_ = conn.Close()
@@ -87,8 +114,12 @@ func (r *receiver) reportFatal(err error) {
 
 func (r *receiver) consume(conn net.Conn, epoch [16]byte) {
 	defer conn.Close()
+	version := r.protocolVersion
+	if version == 0 {
+		version = 1
+	} // tests and explicit legacy receiver construction
 	for {
-		frame, err := gethhook.ReadNativeStreamFrame(conn)
+		frame, err := gethhook.ReadNativeStreamFrameVersion(conn, version)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "native receiver disconnected:", err)
 			return
@@ -98,7 +129,7 @@ func (r *receiver) consume(conn net.Conn, epoch [16]byte) {
 			r.mu.Unlock()
 			return
 		}
-		block := outputBlock{Epoch: hex.EncodeToString(epoch[:]), Sequence: frame.Sequence, Number: frame.BlockNumber, Hash: frame.BlockHash.Hex(), Parent: frame.ParentHash.Hex(), Complete: frame.Complete, ContinuityUnknown: r.lastSeq == 0, Transactions: make([]outputTx, 0, len(frame.Txs))}
+		block := outputBlock{Schema: fmt.Sprintf("native_stream_v%d", version), FrameVersion: version, Epoch: hex.EncodeToString(epoch[:]), Sequence: frame.Sequence, Number: frame.BlockNumber, Hash: frame.BlockHash.Hex(), Parent: frame.ParentHash.Hex(), Complete: frame.Complete, ContinuityUnknown: r.lastSeq == 0, Transactions: make([]outputTx, 0, len(frame.Txs))}
 		if r.lastSeq != 0 {
 			switch {
 			case !bytes.Equal(epoch[:], r.epoch[:]):
@@ -113,10 +144,27 @@ func (r *receiver) consume(conn net.Conn, epoch [16]byte) {
 				block.Gap += fmt.Sprintf("chain_%d_to_%d_or_reorg", r.lastNumber, frame.BlockNumber)
 			}
 		}
-		for _, tx := range frame.Txs {
-			out := outputTx{Hash: tx.TxHash.Hex(), Type: tx.TxType}
+		for i, tx := range frame.Txs {
+			factsComplete := version == 2 && tx.FactsComplete
+			out := outputTx{Hash: tx.TxHash.Hex(), Index: uint32(i), Type: tx.TxType, FactsComplete: factsComplete, Transfers: make([]outputTransfer, 0, len(tx.Transfers)), Calls: make([]outputCall, 0), LogScopes: make([]outputLogScope, 0)}
 			for _, tr := range tx.Transfers {
-				out.Transfers = append(out.Transfers, outputTransfer{From: tr.From.Hex(), To: tr.To.Hex(), ValueWei: tr.Value.String(), Kind: tr.Kind})
+				var path []uint16 // V1 has no trace path; JSON null means unknown.
+				if factsComplete {
+					path = append([]uint16{}, tr.TraceAddress...)
+				}
+				out.Transfers = append(out.Transfers, outputTransfer{From: tr.From.Hex(), To: tr.To.Hex(), ValueWei: tr.Value.String(), Kind: tr.Kind, TraceAddress: path})
+			}
+			if factsComplete {
+				for _, call := range tx.Calls {
+					value := "0"
+					if call.Value != nil {
+						value = call.Value.String()
+					}
+					out.Calls = append(out.Calls, outputCall{TraceAddress: append([]uint16{}, call.TraceAddress...), From: call.From.Hex(), To: call.To.Hex(), Kind: call.Kind, ValueWei: value, InputHex: "0x" + hex.EncodeToString(call.Input), Success: call.Success})
+				}
+				for _, scope := range tx.LogScopes {
+					out.LogScopes = append(out.LogScopes, outputLogScope{LogIndex: scope.Index, TraceAddress: append([]uint16{}, scope.TraceAddress...)})
+				}
 			}
 			block.Transactions = append(block.Transactions, out)
 		}
@@ -136,7 +184,18 @@ func (r *receiver) consume(conn net.Conn, epoch [16]byte) {
 
 func main() {
 	path := flag.String("listen", "/run/rh-native-transfer/receiver.sock", "Unix socket for the native stream stunnel server")
+	protocol := flag.String("protocol", "v2", "native stream protocol: v2 includes call/log facts; v1 is legacy transfers only")
 	flag.Parse()
+	var version uint8
+	switch *protocol {
+	case "v1":
+		version = 1
+	case "v2":
+		version = 2
+	default:
+		fmt.Fprintln(os.Stderr, "invalid -protocol (expected v1 or v2)")
+		os.Exit(2)
+	}
 	if err := os.MkdirAll(filepath.Dir(*path), 0o700); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -166,7 +225,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	r := &receiver{output: os.Stdout, fatal: make(chan error, 1)}
+	r := &receiver{output: os.Stdout, fatal: make(chan error, 1), protocolVersion: version}
 	go func() {
 		err := <-r.fatal
 		fmt.Fprintln(os.Stderr, "native receiver fatal output error:", err)

@@ -1,6 +1,7 @@
 package arbos
 
 import (
+	"bytes"
 	"errors"
 	"math/big"
 	"testing"
@@ -11,6 +12,34 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/core/vm/runtime"
 )
+
+func TestNativeCallFactsBindV4SwapLogsAndRollback(t *testing.T) {
+	caller, manager := common.HexToAddress("0xbd665831a520182e944af92b23a317791c5d8efa"), common.HexToAddress("0x8366a39cc670b4001a1121b8f6a443a643e40951")
+	c := new(nativeTxCollector)
+	h := c.hooks()
+	h.OnEnter(0, byte(vm.CALL), caller, caller, nil, 0, big.NewInt(0))
+	h.OnEnter(1, byte(vm.CALL), caller, manager, []byte{0x48, 0xc8, 0x94, 0x91}, 0, big.NewInt(0))
+	input := append([]byte{0xf3, 0xcd, 0x91, 0x4c}, bytes.Repeat([]byte{0x11}, 400)...)
+	h.OnEnter(2, byte(vm.CALL), caller, manager, input, 0, big.NewInt(0))
+	h.OnLog(&types.Log{Index: 19})
+	h.OnExit(2, nil, 0, nil, false)
+	h.OnEnter(2, byte(vm.CALL), caller, manager, input, 0, big.NewInt(0))
+	h.OnLog(&types.Log{Index: 20})
+	h.OnExit(2, nil, 0, nil, false)
+	h.OnEnter(2, byte(vm.CALL), caller, manager, input, 0, big.NewInt(0))
+	h.OnLog(&types.Log{Index: 21})
+	h.OnExit(2, nil, 0, errors.New("reverted"), true)
+	h.OnExit(1, nil, 0, nil, false)
+	h.OnExit(0, nil, 0, nil, false)
+	complete, calls, logs := c.facts(&types.Receipt{Status: types.ReceiptStatusSuccessful})
+	if !complete || len(calls) != 3 || len(logs) != 2 {
+		t.Fatalf("facts: complete=%v calls=%d logs=%d", complete, len(calls), len(logs))
+	}
+	if len(calls[1].Input) != 324 || !calls[1].Success || len(calls[1].TraceAddress) != 2 || calls[1].TraceAddress[0] != 0 || calls[1].TraceAddress[1] != 0 ||
+		len(calls[2].TraceAddress) != 2 || calls[2].TraceAddress[1] != 1 || logs[0].Index != 19 || logs[1].Index != 20 || logs[0].TraceAddress[1] != 0 || logs[1].TraceAddress[1] != 1 {
+		t.Fatalf("incorrect call/log binding: calls=%+v logs=%+v", calls, logs)
+	}
+}
 
 func TestNativeTransferCollectorRevertAndKinds(t *testing.T) {
 	a, b, c := common.HexToAddress("0x1"), common.HexToAddress("0x2"), common.HexToAddress("0x3")
@@ -131,6 +160,38 @@ func BenchmarkNativeTransferHookExecution(b *testing.B) {
 		code = append(code, byte(vm.PUSH1), 1, byte(vm.POP))
 	}
 	code = append(code, byte(vm.STOP))
+	for _, enabled := range []bool{false, true} {
+		name := "off"
+		if enabled {
+			name = "on"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				cfg := &runtime.Config{GasLimit: 1_000_000}
+				if enabled {
+					cfg.EVMConfig.Tracer = new(nativeTxCollector).hooks()
+				}
+				if _, _, err := runtime.Execute(code, nil, cfg); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// Same bytecode off/on: a 324-byte V4-selector call to the identity precompile.
+// This exercises OnEnter path construction and bounded calldata copying during
+// real EVM execution. runtime.Execute does not wrap StateDB for OnLog, so log
+// scope capture is verified by the dedicated unit test instead.
+func BenchmarkNativeCallFactExecution(b *testing.B) {
+	code := []byte{byte(vm.PUSH32)}
+	code = append(code, 0xf3, 0xcd, 0x91, 0x4c)
+	code = append(code, make([]byte, 28)...)
+	code = append(code, byte(vm.PUSH1), 0, byte(vm.MSTORE),
+		byte(vm.PUSH1), 0, byte(vm.PUSH1), 0, byte(vm.PUSH2), 1, 68,
+		byte(vm.PUSH1), 0, byte(vm.PUSH1), 0, byte(vm.PUSH1), 4,
+		byte(vm.PUSH2), 0xff, 0xff, byte(vm.CALL), byte(vm.POP), byte(vm.STOP))
 	for _, enabled := range []bool{false, true} {
 		name := "off"
 		if enabled {
