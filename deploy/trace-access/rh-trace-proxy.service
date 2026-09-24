@@ -1,0 +1,46 @@
+[Unit]
+Description=Allowlisted Nitro callTracer HTTP Unix proxy
+After=rh-nitro.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+ExecStart=/usr/local/libexec/rpc-trace-proxy --listen /run/rh-trace-proxy/trace.sock --ipc /data/nitro/ipc/nitro-debug.ipc --concurrency 4 --timeout 20s --max-request-bytes 16384 --max-response-bytes 67108864
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+RuntimeDirectory=rh-trace-proxy
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=GOMEMLIMIT=768MiB
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=64
+LimitNOFILE=256
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The IPC directory is read-only in this mount namespace; connect(2) still works.
+ReadOnlyPaths=/data/nitro/ipc
+InaccessiblePaths=/etc/rh-storage-delta/tls
+
+[Install]
+WantedBy=multi-user.target
