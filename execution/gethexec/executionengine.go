@@ -52,6 +52,7 @@ import (
 	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/execution/gethexec/addressfilter"
 	"github.com/offchainlabs/nitro/execution/gethexec/eventfilter"
+	"github.com/offchainlabs/nitro/gethhook"
 	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/offchainlabs/nitro/util/containers"
 	"github.com/offchainlabs/nitro/util/sharedmetrics"
@@ -263,9 +264,12 @@ type L1PriceData struct {
 type ExecutionEngine struct {
 	stopwaiter.StopWaiter
 
-	bc        *core.BlockChain
-	consensus consensus.FullConsensusClient
-	recorder  *BlockRecorder
+	bc            *core.BlockChain
+	nativeJournal *gethhook.NativeJournal
+	nativeStream  *gethhook.NativeStream
+	nativePending *arbos.NativeBlockEvidence // protected by createBlocksMutex; prefetch does not touch it
+	consensus     consensus.FullConsensusClient
+	recorder      *BlockRecorder
 
 	resequenceChan    chan []*arbostypes.MessageWithMetadata
 	createBlocksMutex sync.Mutex
@@ -733,6 +737,7 @@ func writeAndLog(pprof, trace *bytes.Buffer) {
 }
 
 func (s *ExecutionEngine) sequenceTransactionsWithBlockMutex(header *arbostypes.L1IncomingMessageHeader, hooks *FullSequencingHooks, timeboostedTxs map[common.Hash]struct{}) (*types.Block, error) {
+	s.nativePending = nil
 	lastBlockHeader, err := s.getCurrentHeader()
 	if err != nil {
 		return nil, err
@@ -762,7 +767,11 @@ func (s *ExecutionEngine) sequenceTransactionsWithBlockMutex(header *arbostypes.
 	delayedMessagesRead := lastBlockHeader.Nonce.Uint64()
 
 	startTime := time.Now()
-	block, statedb, receipts, err := arbos.ProduceBlockAdvanced(
+	var nativeCollector *arbos.NativeTransferCollector
+	if s.nativeJournal != nil || s.nativeStream.Connected() {
+		nativeCollector = new(arbos.NativeTransferCollector)
+	}
+	block, statedb, receipts, err := arbos.ProduceBlockAdvancedWithNativeTransfers(
 		header,
 		delayedMessagesRead,
 		lastBlockHeader,
@@ -773,9 +782,13 @@ func (s *ExecutionEngine) sequenceTransactionsWithBlockMutex(header *arbostypes.
 		core.NewMessageSequencingContext(s.wasmTargets),
 		s.exposeMultiGas,
 		s.addressChecker,
+		nativeCollector,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if nativeCollector != nil {
+		s.nativePending = nativeCollector.Block
 	}
 	blockCalcTime := time.Since(startTime)
 	blockExecutionTimer.Update(blockCalcTime.Nanoseconds())
@@ -933,6 +946,13 @@ func (s *ExecutionEngine) MessageIndexToBlockNumber(msgIdx arbutil.MessageIndex)
 // Regular live sequencing of directly-received L2 transactions (which happens
 // in sequenceTransactionsWithBlockMutex) does not go through this function.
 func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWithMetadata, isMsgForPrefetch bool, isDelayedSequencing bool) (*types.Block, *state.StateDB, types.Receipts, error) {
+	var nativeCollector *arbos.NativeTransferCollector
+	if !isMsgForPrefetch {
+		s.nativePending = nil
+		if s.nativeJournal != nil || s.nativeStream.Connected() {
+			nativeCollector = new(arbos.NativeTransferCollector)
+		}
+	}
 	currentHeader := s.bc.CurrentBlock()
 	if currentHeader == nil {
 		return nil, nil, nil, errors.New("failed to get current block header")
@@ -995,7 +1015,7 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 		}
 		filteringHooks := NewDelayedFilteringSequencingHooks(txes, s.eventFilter, inboxRequestId, chainConfig.ChainID.Uint64())
 
-		block, statedb, receipts, err := arbos.ProduceBlockAdvanced(
+		block, statedb, receipts, err := arbos.ProduceBlockAdvancedWithNativeTransfers(
 			msg.Message.Header,
 			msg.DelayedMessagesRead,
 			currentHeader,
@@ -1006,6 +1026,7 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 			runCtx,
 			s.exposeMultiGas,
 			s.addressChecker,
+			nativeCollector,
 		)
 		if err != nil {
 			return nil, nil, nil, err
@@ -1039,10 +1060,13 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 				DelayedMsgIdx: msg.DelayedMessagesRead - 1,
 			}
 		}
+		if nativeCollector != nil {
+			s.nativePending = nativeCollector.Block
+		}
 		return block, statedb, receipts, nil
 	}
 
-	block, statedb, receipts, err := arbos.ProduceBlock(
+	block, statedb, receipts, err := arbos.ProduceBlockWithNativeTransfers(
 		msg.Message,
 		msg.DelayedMessagesRead,
 		currentHeader,
@@ -1051,7 +1075,11 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 		isMsgForPrefetch,
 		runCtx,
 		s.exposeMultiGas,
+		nativeCollector,
 	)
+	if err == nil && nativeCollector != nil {
+		s.nativePending = nativeCollector.Block
+	}
 
 	return block, statedb, receipts, err
 }
@@ -1078,6 +1106,17 @@ func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB
 			return errors.New("geth rejected block as non-canonical")
 		}
 	}
+	if s.nativeJournal != nil {
+		if !s.nativeJournal.Submit(block, s.nativePending) {
+			log.Error("native evidence unavailable after canonical block; trace backfill required", "block", block.NumberU64(), "hash", block.Hash())
+		}
+	}
+	if s.nativeStream != nil && s.nativePending != nil && s.nativeStream.Connected() {
+		if !s.nativeStream.Publish(block, s.nativePending) {
+			log.Warn("native stream dropped canonical block", "block", block.NumberU64(), "hash", block.Hash())
+		}
+	}
+	s.nativePending = nil
 	blockWriteToDbTimer.Update(time.Since(startTime).Nanoseconds())
 	baseFeeGauge.Update(block.BaseFee().Int64())
 	txCountHistogram.Update(int64(len(block.Transactions()) - 1))
@@ -1318,11 +1357,35 @@ func (s *ExecutionEngine) ArbOSVersionForMessageIndex(msgIdx arbutil.MessageInde
 }
 
 func (s *ExecutionEngine) Start(ctxIn context.Context) error {
+	stream, err := gethhook.NewNativeStreamFromEnv()
+	if err != nil {
+		return fmt.Errorf("configure native stream: %w", err)
+	}
+	s.nativeStream = stream
+	journal, err := gethhook.OpenNativeJournalFromEnv()
+	if err != nil {
+		return fmt.Errorf("open configured native journal: %w", err)
+	}
+	s.nativeJournal = journal
+	if journal != nil {
+		if head := s.bc.CurrentBlock(); head != nil {
+			if err := journal.CheckCanonicalHead(head.Number.Uint64(), head.Hash()); err != nil {
+				_ = journal.Close()
+				return fmt.Errorf("persist native journal tail status: %w", err)
+			}
+		}
+	}
 	s.StopWaiter.Start(ctxIn, s)
 
 	ctx, err := s.GetContextSafe()
 	if err != nil {
 		return err
+	}
+	if journal != nil {
+		s.LaunchThread(journal.Run)
+	}
+	if stream != nil {
+		s.LaunchThread(stream.Run)
 	}
 
 	if s.transactionFiltererRPCClient != nil {

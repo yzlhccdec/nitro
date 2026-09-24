@@ -88,6 +88,7 @@ type blockBuildState struct {
 	userTxsProcessed     int
 	complete             types.Transactions
 	receipts             types.Receipts
+	nativeEvidence       []NativeTxEvidence
 	redeems              types.Transactions
 	activeGroupCP        *groupCheckpoint
 }
@@ -117,6 +118,7 @@ type groupCheckpoint struct {
 	userTxsProcessed     int
 	completeLen          int
 	receiptsLen          int
+	nativeEvidenceLen    int
 	userTx               *types.Transaction
 	txCheckpoint         txCheckpoint
 }
@@ -137,6 +139,7 @@ func (s *blockBuildState) saveGroupCheckpoint(header *types.Header, checkpoint t
 		userTxsProcessed:     s.userTxsProcessed,
 		completeLen:          len(s.complete),
 		receiptsLen:          len(s.receipts),
+		nativeEvidenceLen:    len(s.nativeEvidence),
 		userTx:               userTx,
 		txCheckpoint:         checkpoint,
 	}
@@ -159,6 +162,7 @@ func (s *blockBuildState) rollbackToGroupCheckpoint(header *types.Header) error 
 	s.redeems = s.redeems[:0]
 	s.complete = s.complete[:cp.completeLen]
 	s.receipts = s.receipts[:cp.receiptsLen]
+	s.nativeEvidence = s.nativeEvidence[:cp.nativeEvidenceLen]
 	var err error
 	s.arbState, err = arbosState.OpenSystemArbosState(s.statedb, nil, true)
 	if err != nil {
@@ -315,6 +319,35 @@ func ProduceBlock(
 	)
 }
 
+// ProduceBlockWithNativeTransfers is the normal message path with optional
+// first-pass native evidence. Prefetch callers must pass nil.
+func ProduceBlockWithNativeTransfers(
+	message *arbostypes.L1IncomingMessage,
+	delayedMessagesRead uint64,
+	lastBlockHeader *types.Header,
+	statedb *state.StateDB,
+	chainContext core.ChainContext,
+	isMsgForPrefetch bool,
+	runCtx *core.MessageRunContext,
+	exposeMultiGas bool,
+	collector *NativeTransferCollector,
+) (*types.Block, *state.StateDB, types.Receipts, error) {
+	if collector == nil {
+		return ProduceBlock(message, delayedMessagesRead, lastBlockHeader, statedb,
+			chainContext, isMsgForPrefetch, runCtx, exposeMultiGas)
+	}
+	chainConfig := chainContext.Config()
+	lastArbosVersion := types.DeserializeHeaderExtraInformation(lastBlockHeader).ArbOSFormatVersion
+	txes, err := ParseL2Transactions(message, chainConfig.ChainID, lastArbosVersion)
+	if err != nil {
+		log.Warn("error parsing incoming message", "err", err)
+		txes = types.Transactions{}
+	}
+	return ProduceBlockAdvancedWithNativeTransfers(message.Header, delayedMessagesRead, lastBlockHeader,
+		statedb, chainContext, NewNoopSequencingHooks(txes), isMsgForPrefetch, runCtx,
+		exposeMultiGas, nil, collector)
+}
+
 // A bit more flexible than ProduceBlock for use in the sequencer.
 func ProduceBlockAdvanced(
 	l1Header *arbostypes.L1IncomingMessageHeader,
@@ -328,6 +361,48 @@ func ProduceBlockAdvanced(
 	exposeMultiGas bool,
 	addressChecker state.AddressChecker,
 ) (*types.Block, *state.StateDB, types.Receipts, error) {
+	return produceBlockAdvanced(l1Header, delayedMessagesRead, lastBlockHeader, statedb, chainContext, sequencingHooks, isMsgForPrefetch, runCtx, exposeMultiGas, addressChecker, nil)
+}
+
+// ProduceBlockAdvancedWithNativeTransfers captures successful nonzero EVM
+// internal value transfers on the first execution pass. It does not publish.
+func ProduceBlockAdvancedWithNativeTransfers(
+	l1Header *arbostypes.L1IncomingMessageHeader,
+	delayedMessagesRead uint64,
+	lastBlockHeader *types.Header,
+	statedb *state.StateDB,
+	chainContext core.ChainContext,
+	sequencingHooks SequencingHooks,
+	isMsgForPrefetch bool,
+	runCtx *core.MessageRunContext,
+	exposeMultiGas bool,
+	addressChecker state.AddressChecker,
+	collector *NativeTransferCollector,
+) (*types.Block, *state.StateDB, types.Receipts, error) {
+	if collector == nil {
+		return ProduceBlockAdvanced(l1Header, delayedMessagesRead, lastBlockHeader,
+			statedb, chainContext, sequencingHooks, isMsgForPrefetch, runCtx,
+			exposeMultiGas, addressChecker)
+	}
+	return produceBlockAdvanced(l1Header, delayedMessagesRead, lastBlockHeader, statedb, chainContext, sequencingHooks, isMsgForPrefetch, runCtx, exposeMultiGas, addressChecker, collector)
+}
+
+func produceBlockAdvanced(
+	l1Header *arbostypes.L1IncomingMessageHeader,
+	delayedMessagesRead uint64,
+	lastBlockHeader *types.Header,
+	statedb *state.StateDB,
+	chainContext core.ChainContext,
+	sequencingHooks SequencingHooks,
+	isMsgForPrefetch bool,
+	runCtx *core.MessageRunContext,
+	exposeMultiGas bool,
+	addressChecker state.AddressChecker,
+	collector *NativeTransferCollector,
+) (*types.Block, *state.StateDB, types.Receipts, error) {
+	if collector != nil {
+		collector.Block = nil
+	}
 
 	arbState, err := arbosState.OpenSystemArbosState(statedb, nil, false)
 	if err != nil {
@@ -439,6 +514,7 @@ func ProduceBlockAdvanced(
 		preTxHeaderGasUsed := header.GasUsed
 		arbosVersion := buildState.arbState.ArbOSVersion()
 		signer := types.MakeSigner(chainConfig, header.Number, header.Time, arbosVersion)
+		var nativeTx *nativeTxCollector
 		receipt, result, err := (func() (*types.Receipt, *core.ExecutionResult, error) {
 			// If we've done too much work in this block, discard the tx as early as possible
 			if buildState.blockGasLeft < params.TxGas && isUserTx {
@@ -518,7 +594,16 @@ func ProduceBlockAdvanced(
 
 			gasPool := gethGas
 			blockContext := core.NewEVMBlockContext(header, chainContext, &header.Coinbase)
-			evm := vm.NewEVM(blockContext, buildState.statedb, chainConfig, vm.Config{ExposeMultiGas: exposeMultiGas})
+			vmConfig := vm.Config{ExposeMultiGas: exposeMultiGas}
+			if collector != nil && !isMsgForPrefetch && nativeUserEvmTx(tx.Type()) {
+				nativeTx = new(nativeTxCollector)
+				vmConfig.Tracer = nativeTx.hooks()
+			}
+			var evmState vm.StateDB = buildState.statedb
+			if nativeTx != nil {
+				evmState = state.NewHookedState(buildState.statedb, vmConfig.Tracer)
+			}
+			evm := vm.NewEVM(blockContext, evmState, chainConfig, vmConfig)
 			receipt, result, err := core.ApplyTransactionWithResultFilter(
 				evm,
 				&gasPool,
@@ -688,6 +773,13 @@ func ProduceBlockAdvanced(
 
 		buildState.complete = append(buildState.complete, tx)
 		buildState.receipts = append(buildState.receipts, receipt)
+		if collector != nil && !isMsgForPrefetch {
+			evidence := NativeTxEvidence{TxHash: tx.Hash(), TxType: tx.Type()}
+			if nativeTx != nil {
+				evidence.Transfers = nativeTx.transfers(receipt)
+			}
+			buildState.nativeEvidence = append(buildState.nativeEvidence, evidence)
+		}
 
 		if isUserTx {
 			if buildState.activeGroupCP == nil {
@@ -739,6 +831,17 @@ func ProduceBlockAdvanced(
 		log.Error("Unexpected total balance delta", "delta", balanceDelta, "expected", buildState.expectedBalanceDelta)
 	}
 
+	if collector != nil && !isMsgForPrefetch {
+		if len(buildState.nativeEvidence) != len(block.Transactions()) {
+			return nil, nil, nil, fmt.Errorf("native evidence count %d does not match %d block transactions", len(buildState.nativeEvidence), len(block.Transactions()))
+		}
+		for i, tx := range block.Transactions() {
+			if buildState.nativeEvidence[i].TxHash != tx.Hash() {
+				return nil, nil, nil, fmt.Errorf("native evidence tx %d does not match block", i)
+			}
+		}
+		collector.Block = &NativeBlockEvidence{BlockHash: block.Hash(), Txs: buildState.nativeEvidence}
+	}
 	return block, buildState.statedb, buildState.receipts, nil
 }
 
